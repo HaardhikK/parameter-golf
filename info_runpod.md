@@ -7,7 +7,7 @@ Step-by-step guide for a fresh Ubuntu 22.04/24.04 environment (e.g. a RunPod con
 ## Quick Start (3 commands after SSH)
 
 ```bash
-git clone https://github.com/<your-fork>/parameter-golf.git
+git clone https://github.com/HaardhikK/parameter-golf.git
 cd parameter-golf
 bash setup.sh
 ```
@@ -33,7 +33,7 @@ Then download data and train (see steps below).
 
 ```bash
 cd /workspace
-git clone https://github.com/<your-fork>/parameter-golf.git
+git clone https://github.com/HaardhikK/parameter-golf.git
 cd parameter-golf
 ```
 

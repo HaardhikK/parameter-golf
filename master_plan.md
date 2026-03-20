@@ -210,6 +210,132 @@ TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=fullgraph \
 
 ---
 
+## Phase 7: Leaderboard #1 Techniques Integration
+
+**Context**: The current #1 entry on the leaderboard achieves **1.1748 BPB** (3 seeds, p<0.001) vs our best 1.3954 BPB on 1×H100. Their techniques are well-documented and can be layered on top of our existing advantages (SwiGLU, value residuals, back-out, weight sharing, QAT). Key rules discovery: evaluation has a **separate 10-min budget** from training, and the FAQ explicitly says "we encourage competitors to push the bounds of evaluation methods as aggressively as with training methods" — making sliding window eval fully legitimate.
+
+### Step 7.1: Muon Weight Decay 🔴 TODO
+**Expected: 0.005–0.015 BPB | Risk: Very low | ~6 lines**
+
+The #1 entry uses `weight_decay=0.02` for Muon. Currently our Muon has **no weight decay at all** — it's pure momentum + Newton-Schulz zero-power approximation. Adding decoupled weight decay improves generalization and quantization robustness (smaller weight magnitudes → less quant error).
+
+- **How decoupled weight decay works**: Applied directly to the parameter AFTER the gradient step, not added to the gradient. Critical: Muon normalizes gradients via Newton-Schulz, so adding WD to the gradient would be meaningless. Must be: `p.mul_(1 - lr * weight_decay)` after `p.add_(g, alpha=-lr)`.
+- **Files**: `train_gpt.py` — Hyperparameters (~line 92), Muon `__init__` + `step()` (~lines 117-173), optimizer construction (~line 965)
+- **Changes**:
+  1. Add `muon_wd = float(os.environ.get("MUON_WD", 0.0))` to Hyperparameters
+  2. Add `weight_decay` to Muon `__init__` defaults dict
+  3. After `p.add_(g, alpha=-lr)` in `Muon.step()`: `if weight_decay > 0: p.mul_(1 - lr * weight_decay)`
+  4. Pass `weight_decay=args.muon_wd` at optimizer construction
+- **Sweep**: MUON_WD in {0.0, 0.01, 0.02, 0.05} via 2-min runs; validate best with full 10-min run
+
+### Step 7.2: FP16 Tied Embedding Export 🔴 TODO
+**Expected: 0.01–0.03 BPB | Risk: Low | ~6 lines**
+
+Currently `tok_emb.weight` (1024×672 = 688,128 elements) exceeds `INT8_KEEP_FLOAT_MAX_NUMEL` (65,536) so it gets quantized to int8 with per-row scales. The problem: with **tied embeddings**, this same weight is used for BOTH the input lookup AND the output logit projection (`F.linear(x, self.tok_emb.weight)`). Int8 quantization errors compound through both paths, degrading BPB at eval time more than other tensors.
+
+- **Size impact**: fp16 = 1.38 MB vs int8 ≈ 0.69 MB = +690 KB. Current headroom 1.7 MB → ~1.0 MB remaining after this change. Fits within 16 MB limit.
+- **Files**: `train_gpt.py` — quantization constants (~line 310) + `quantize_state_dict_int8()` (~lines 347-404)
+- **Changes**:
+  1. Add `INT8_FORCE_FP16_PATTERNS` tuple after `CONTROL_TENSOR_NAME_PATTERNS` (default: `"tok_emb"`, env-var overrideable)
+  2. Inside `quantize_state_dict_int8()`, before the `t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL` check, add:
+     ```python
+     if any(pat in name for pat in INT8_FORCE_FP16_PATTERNS):
+         kept = t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()  # fp16
+         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+         passthrough[name] = kept
+         stats["int8_payload_bytes"] += tensor_nbytes(kept)
+         continue
+     ```
+- **Verify**: `SIZE_ONLY=1` must show artifact < 16 MB. A/B test should show reduced quant gap.
+
+### Step 7.3: Sliding Window Evaluation 🔴 TODO
+**Expected: 0.02–0.06 BPB | Risk: Medium | ~50 lines | THE BIG WIN**
+
+The #1's key insight. Standard eval scores each token with average ~512 context (positions 0-1023 averaged). Sliding window with stride=64 gives every token **960+ context tokens**. This is a pure eval-time improvement — no training changes needed.
+
+**Rules**: FAQ confirms separate 10-min eval budget and explicitly encourages this: *"we encourage competitors to push the bounds of evaluation methods as aggressively as with training methods."*
+
+- **Files**: `train_gpt.py` — `GPT.forward()` (~line 743), add new `eval_val_sliding_window()` function, final eval dispatch (~line 1208)
+- **Design**:
+  1. Modify `GPT.forward()` signature: `target_ids: Tensor | None = None`. When `None`, return logits `(B, T, V)` instead of scalar loss. Costs ~4 lines (branch at end of forward). torch.compile handles this via separate traces.
+  2. Gate with `EVAL_SLIDING_WINDOW=0` env var (default off). Training-time periodic eval stays fast. Only the final post-quant roundtrip uses sliding window.
+  3. New `eval_val_sliding_window(stride=64, eval_seq_len=1024)` function:
+     - Slide windows across val tokens at stride intervals
+     - Call `model(x, target_ids=None)` → logits, then `F.cross_entropy(logits, y, reduction='none')`
+     - Only accumulate loss/bytes for the **last `stride` positions** of each window (those with full context)
+     - Exception: first window scores all positions
+     - Batch 32-64 windows per forward for GPU efficiency
+     - Distribute windows across ranks, all-reduce final sums
+  4. Dispatch at final eval: `if args.eval_sliding_window: eval_val_sliding_window(...) else: eval_val(...)`
+- **Timing**: ~16× more compute. On 8×H100: ~60-90s. On 1×H100: ~8-9 min (tight but feasible; increase stride to 128 if needed).
+- **Regression test**: `EVAL_SLIDING_WINDOW=1 EVAL_SW_STRIDE=1024` (no overlap) must produce identical results to standard `eval_val()`.
+- **Compile note**: Use `base_model` for the sliding window eval forward to avoid interaction with the DDP/compiled training model.
+
+### Step 7.4: Overtone Spectral Embedding Init 🔴 TODO
+**Expected: 0.005–0.015 BPB | Risk: Low-medium | ~15 lines**
+
+Currently embeddings are initialized `N(0, 0.005)` — a narrow isotropic Gaussian. The #1 uses SVD power-law spectrum shaping (`S_k ~ k^{-0.5}`), matching the natural spectral structure of language embeddings. Better initialization → faster and better convergence.
+
+- **Files**: `train_gpt.py` — add `overtone_init()` helper + modify `GPT._init_weights()` (~line 736)
+- **Changes**:
+  1. Add `EMBED_INIT_MODE` HP (default "gaussian", alt "overtone") and `EMBED_INIT_ALPHA` (default 0.5)
+  2. Add `overtone_init(weight, std, alpha=0.5)`:
+     - Generate random orthogonal U via `torch.linalg.qr(randn(vocab, min(vocab,dim)))`
+     - Generate random orthogonal V via `torch.linalg.qr(randn(dim, min(vocab,dim)))`
+     - Singular values: `S_k = k^{-alpha}` (power law decay)
+     - Construct: `W = U @ diag(S) @ V.T`, then scale to desired std
+     - All at init time (before compile), no impact on compiled graphs
+  3. In `_init_weights()`: branch on `embed_init_mode`
+- **Sweep**: A/B test "gaussian" vs "overtone" over 2-min runs
+
+### Step 7.5: Phase-Transition Residual Mixing Init 🔴 TODO
+**Expected: 0.003–0.010 BPB | Risk: Low | ~8 lines**
+
+Currently `resid_mixes` is initialized to `[[1,0,...],[0,0,...]]` for every layer — meaning 100% current state, 0% initial embedding (x0). The #1 uses sigmoid-scheduled initialization so early layers preserve more of the initial embedding and later layers rely more on the processed representation. This better matches intuition: early layers should maintain more input signal, later layers should abstract more.
+
+- **Files**: `train_gpt.py` — `GPT.__init__()` resid_mixes initialization (~lines 709-712)
+- **Changes**:
+  1. Add `RESID_MIX_INIT` HP (default "flat", alt "sigmoid"), `RESID_MIX_ALPHA` (steepness, default 4.0), `RESID_MIX_CENTER` (center fraction, default 0.5)
+  2. When `resid_mix_init == "sigmoid"`:
+     ```python
+     frac = i / max(num_layers - 1, 1)
+     current_w = torch.sigmoid(torch.tensor(alpha * (frac - center))).item()
+     mix = torch.stack((torch.full((dim,), current_w), torch.full((dim,), 1-current_w)))
+     ```
+  3. Parameters remain fully learnable — this only changes where they START
+- **Sweep**: A/B test "flat" vs "sigmoid" over 2-min runs
+
+---
+
+### Phase 7 Implementation Sequence
+
+| Phase | Changes | Lines Added | When |
+|-------|---------|-------------|------|
+| A | Muon WD + FP16 embedding | ~12 | First — independent, highest value-to-risk |
+| B | Overtone init + phase-transition resid | ~23 | Second — init changes, A/B test each |
+| C | Sliding window eval | ~50 | Last — largest change, needs A+B validated first |
+
+**Final line count after all**: ~1317/1500 (183 lines headroom)
+
+### Phase 7 Verification Protocol
+
+For every technique:
+1. Smoke test: `ITERATIONS=4 COMPILE_MODE=off` — loss must decrease
+2. `SIZE_ONLY=1` — artifact must stay < 16 MB
+3. Compile: `COMPILE_MODE=fullgraph ITERATIONS=2`
+4. 2-min A/B sweep with env var toggle
+5. Full 10-min validation run if it wins the sweep
+
+Sliding window extra checks:
+- Regression: `EVAL_SW_STRIDE=1024` must match standard eval exactly
+- Timing: eval time must be < 600s on target hardware
+
+### Note on the #1's "10 Layers" Technique
+
+The #1 uses 10 **unique** layers (no weight sharing) at dim≈512. We use 15 **virtual** layers at dim=672 with weight sharing. These are different architectural tradeoffs — our approach gives us wider per-block compute and more virtual depth but at the cost of diversity between layers. This is not directly adoptable without a full architecture redesign. It should be explored via **Exp C: ILP Architecture Search** which can compare P×V configurations head-to-head.
+
+---
+
 ## AutoResearch Integration (Phase 6)
 
 ### What AutoResearch Is
