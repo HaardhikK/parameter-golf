@@ -21,7 +21,7 @@
 `artifact_bytes ≈ (param_count + 225K) × 0.918 + 48K`
 Max params fitting in 16 MB: ~17.15M. We are already at the ceiling.
 
-**Local setup**: RTX 4050 (5 GB VRAM), 10 training shards, WSL2 Ubuntu 24.04.
+**Cloud setup**: RunPod 1×H100 80GB, 80 training shards, ~635 steps in 10 min at 945ms/step.
 
 ---
 
@@ -55,13 +55,12 @@ Virtual layer params stored in `nn.ParameterList`: `attn_scales`, `mlp_scales`, 
 - **16,548,852 params**, estimated trained artifact ~14.7 MB (~1.3 MB headroom)
 - Verified: untrained artifact = 4.87 MB, loss decreases 6.95→6.54 in 4 steps, memory 1037 MiB
 
-#### Step 1.3: Hyperparameter Tuning 🔴 TODO (HIGHEST PRIORITY)
-LRs were tuned for old 9-block dim=512 arch. Config B is wider and recurrent — needs retuning.
-- **matrix_lr**: Shared blocks accumulate 3× gradient magnitude → try 0.01–0.03
-- **tied_embed_lr**: Wider embedding — try 0.02–0.08
-- **scalar_lr**: Per-virtual-layer params — may need lower LR
-- **warmdown_iters**: Fewer total steps expected (~5000–7000 vs 13,780) — scale proportionally
-- **Method**: 2–3 min cloud sweeps, then full 10-min run with best config
+#### Step 1.3: Hyperparameter Tuning ✅ DONE
+Tuned on 1×H100 via 2-min sweeps validated with full 10-min run.
+- **matrix_lr**: 0.04→0.08 (higher works due to Muon gradient normalization)
+- **tied_embed_lr**: 0.05→0.02 (lower is better for tied embeddings)
+- **warmdown_iters**: 1200→200 (1200 was catastrophic — LR never reached full value)
+- **scalar_lr**: 0.04 (kept default, not yet swept)
 
 ### Phase 2: Quantization-Aware Training
 
@@ -75,11 +74,9 @@ Only if headroom becomes tight.
 
 ### Phase 3: Zero-Cost Architecture Improvements
 
-#### Step 3.1: Value Residuals 🟡 REVISED
-With GQA, kv_dim (336) ≠ model_dim (672) — simple implementation doesn't work.
-- **Option A**: Single shared `W_v0: (model_dim → kv_dim)` shared across ALL virtual layers (adds ~226K params total) → `v = v + alpha * W_v0(x0)` per virtual layer with per-layer alpha scalar
-- **Option B**: Add x0 directly as skip to residual stream AFTER attention — 1 scalar per virtual layer, no matrix
-Expected: 0.005–0.01 BPB
+#### Step 3.1: Value Residuals ✅ DONE (Option B)
+x0 skip after attention with zero-init per-layer scalar alpha. No matrix needed.
+Combined with back-out mechanism (Step Exp D).
 
 #### Step 3.2: Smear Module ✅ DONE
 Per-virtual-layer causal 1-token lookback: `F.pad(x[:,:-1,:], (0,0,1,0))`.
@@ -122,13 +119,9 @@ Risk: must verify zstd availability on RunPod evaluation environment.
 
 ## New Experimental Ideas
 
-### Exp A: SwiGLU MLP 🔴 TODO
-Current MLP uses ReLU²: `relu(fc(x)).square()`.
-**Key insight**: SwiGLU with 2/3 hidden dim = **same param count** as ReLU² with full hidden dim:
-- Current: fc(672→1344) + proj(1344→672) = 1,806,336 params
-- SwiGLU: gate(672→896) + fc(672→896) + proj(896→672) = 1,806,336 params (same!)
-Implementation: 3 projections, activation = `silu(gate(x)) * fc(x)`, proj reduces back.
-Expected: 0.005–0.015 BPB. Risk: low — same param count.
+### Exp A: SwiGLU MLP ✅ DONE
+Replaced ReLU² with SwiGLU: gate(672→896) + fc(672→896) + proj(896→672) = same 1,806,336 params.
+Part of EXP-002 combined result: 0.027 BPB improvement.
 
 ### Exp B: RMSNorm With Learned Scale 🔴 TODO
 Current `RMSNorm` has no learned parameters. Adding per-dim scale adds expressiveness.
@@ -141,10 +134,9 @@ Use `scipy.optimize.milp` or `PuLP` to solve:
 Proxy quality: `C × (total_flops_per_step) × (steps_in_10_min)` — calibrate from cloud runs.
 Pure Python script, no changes to train_gpt.py.
 
-### Exp D: Back-Out Mechanism 🔴 TODO
-At end of each virtual layer: `x = x + backout_weight * x_pre_attn`
-Cost: 1 scalar per virtual layer. Improves gradient flow in deep recurrent architectures.
-(Documented NanoGPT speedrun win.)
+### Exp D: Back-Out Mechanism ✅ DONE
+At end of each virtual layer: `x = x + backout_weight * x_pre`
+Zero-init scalar per layer. Part of EXP-002 combined result.
 
 ### Exp E: EoS-Aligned Batching 🔴 TODO
 Align training sequence boundaries with End-of-Sequence tokens to avoid cross-document attention bleeding.
@@ -184,7 +176,7 @@ TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=fullgraph \
 .venv/bin/python train_gpt.py
 ```
 
-**Check**: (1) loss decreases, (2) artifact size < 16 MB, (3) compile succeeds, (4) roundtrip quant works, (5) memory < 5 GB
+**Check**: (1) loss decreases, (2) artifact size < 16 MB, (3) compile succeeds, (4) roundtrip quant works
 
 ---
 
@@ -195,10 +187,10 @@ TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=fullgraph \
 | 0 | Infrastructure | ✅ Done | — | SIZE_ONLY, 10 shards, update.md |
 | 1.1 | Weight sharing | ✅ Done | Enabler | PhysicalBlock + ParameterList |
 | 1.2 | Config B | ✅ Done | 0.02–0.04? | dim=672, 15 virtual, ~14.7 MB est. |
-| 1.3 | HP tuning | 🔴 TODO | 0.005–0.015 | Needs cloud run first |
+| 1.3 | HP tuning | ✅ Done | 0.027 combined | matrix_lr=0.08, embed_lr=0.02, warmdown=200 |
 | 2.1 | STE QAT | ✅ Done | 0.01–0.03? | Always-on, STE pattern |
 | 2.2 | Entropy reg | 🟡 Deferred | small | Only if tight on space |
-| 3.1 | Value residuals | 🟡 Revised | 0.005–0.01 | Need to pick Option A or B |
+| 3.1 | Value residuals | ✅ Done | part of 0.027 | Option B: x0 skip, zero-init alpha |
 | 3.2 | Smear module | ✅ Done | 0.003–0.008? | Per-virtual-layer, causal |
 | 3.3 | Partial RoPE | ✅ Done | 0.002–0.005? | 50% dims, no params |
 | 4.1 | NorMuon | 🔴 TODO | 0.005–0.01 | Research impl first |
@@ -207,10 +199,10 @@ TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=fullgraph \
 | 5.1 | Long-short attn | 🔴 TODO | 0.005–0.015 | FlexAttention risk |
 | 5.2 | Test-time ctx | 🔴 TODO | 0.005–0.02 | RoPE NTK scaling |
 | 5.3 | zstd | 🟡 Deferred | small | Check RunPod availability |
-| Exp A | SwiGLU MLP | 🔴 TODO | 0.005–0.015 | Same param count |
+| Exp A | SwiGLU MLP | ✅ Done | part of 0.027 | Same param count, 2/3 hidden |
 | Exp B | RMSNorm+scale | 🔴 TODO | small | Per-virtual-layer norms |
 | Exp C | ILP arch search | 🔴 TODO | enabler | Pure Python, scipy.optimize |
-| Exp D | Back-out | 🔴 TODO | 0.002–0.005 | 1 scalar per virtual layer |
+| Exp D | Back-out | ✅ Done | part of 0.027 | 1 scalar per virtual layer |
 | Exp E | EoS batching | 🔴 TODO | small | Data pipeline change |
 | — | submission.json | 🔴 TODO | required | Needed for final PR |
 
@@ -271,7 +263,7 @@ For well-defined techniques (NorMuon, FlexAttention), do NOT rely on AutoResearc
 ---
 
 ## Critical Files
-- `train_gpt.py` — All model code (~1212 lines, limit 1500)
+- `train_gpt.py` — All model code (~1232 lines, limit 1500)
 - `update.md` — Experiment ledger
 - `records/track_10min_16mb/` — Submission folder
 - `data/cached_challenge_fineweb.py` — Download more shards

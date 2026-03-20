@@ -53,7 +53,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -77,9 +77,9 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.02))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.08))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -294,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_weight,smear_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear_weight,smear_weights,value_resid_alpha,value_resid_alphas,backout_weight,backout_weights",
     ).split(",")
     if pattern
 )
@@ -609,17 +609,17 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # SwiGLU MLP: same param count as relu^2 (3 matrices at 2/3 hidden width)
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
+        hidden = int(mlp_mult * dim * 2 / 3)
+        self.gate = CastedLinear(dim, hidden, bias=False)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        return self.proj(F.silu(self.gate(x)) * self.fc(x))
 
 
 class PhysicalBlock(nn.Module):
@@ -642,12 +642,21 @@ class PhysicalBlock(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
 
     def forward(self, x: Tensor, x0: Tensor, attn_scale: Tensor,
-                mlp_scale: Tensor, resid_mix: Tensor, q_gain: Tensor) -> Tensor:
+                mlp_scale: Tensor, resid_mix: Tensor, q_gain: Tensor,
+                value_resid_alpha: Tensor | None = None,
+                backout_weight: Tensor | None = None) -> Tensor:
+        x_pre = x  # save for back-out
         mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x), q_gain=q_gain)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        # Value residual: additional skip from initial embeddings
+        if value_resid_alpha is not None:
+            x = x + value_resid_alpha.to(dtype=x.dtype) * x0
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # Back-out: residual from pre-layer state
+        if backout_weight is not None:
+            x = x + backout_weight.to(dtype=x.dtype) * x_pre
         return x
 
 
@@ -709,6 +718,14 @@ class GPT(nn.Module):
         self.smear_weights = nn.ParameterList([
             nn.Parameter(torch.zeros(model_dim, dtype=torch.float32)) for _ in range(num_layers)
         ])
+        # Value residuals: zero-init scalar per layer for x0 skip connection
+        self.value_resid_alphas = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, dtype=torch.float32)) for _ in range(num_layers)
+        ])
+        # Back-out: zero-init scalar per layer for pre-layer residual
+        self.backout_weights = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, dtype=torch.float32)) for _ in range(num_layers)
+        ])
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -737,7 +754,8 @@ class GPT(nn.Module):
             # Virtual layer forward through shared physical block
             phys_block = self.physical_blocks[i % self.num_physical_blocks]
             x = phys_block(x, x0, self.attn_scales[i], self.mlp_scales[i],
-                           self.resid_mixes[i], self.q_gains[i])
+                           self.resid_mixes[i], self.q_gains[i],
+                           self.value_resid_alphas[i], self.backout_weights[i])
             skips.append(x)
 
         # Second half (decoder): reuses skips in reverse order
@@ -751,7 +769,8 @@ class GPT(nn.Module):
             # Virtual layer forward through shared physical block
             phys_block = self.physical_blocks[layer_idx % self.num_physical_blocks]
             x = phys_block(x, x0, self.attn_scales[layer_idx], self.mlp_scales[layer_idx],
-                           self.resid_mixes[layer_idx], self.q_gains[layer_idx])
+                           self.resid_mixes[layer_idx], self.q_gains[layer_idx],
+                           self.value_resid_alphas[layer_idx], self.backout_weights[layer_idx])
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -930,7 +949,8 @@ def main() -> None:
     ]
     # Virtual layer params (all small, go to scalar optimizer)
     for plist in [base_model.attn_scales, base_model.mlp_scales, base_model.resid_mixes,
-                  base_model.q_gains, base_model.smear_weights]:
+                  base_model.q_gains, base_model.smear_weights,
+                  base_model.value_resid_alphas, base_model.backout_weights]:
         for p in plist:
             scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:

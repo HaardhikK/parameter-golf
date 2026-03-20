@@ -45,6 +45,29 @@ Each entry: **Date | Experiment | Goal | Changes | Artifact Size | BPB | Lessons
   - Heterogeneous updates: must NOT zero tok grad before forward, only after stepping
   - fullgraph=True compilation time scales with virtual layers (~3 min for 15 layers on RTX 4050)
 
+### EXP-002: SwiGLU + Value Residuals + Back-Out + HP Tuning (1xH100)
+- **Date**: 2026-03-20
+- **Goal**: Implement architectural improvements and tune HPs for 1xH100 RunPod
+- **Changes**:
+  - SwiGLU MLP: gate(672→896) + fc(672→896) + proj(896→672) = same 1,806,336 params as ReLU²
+  - Value residuals: zero-init per-layer scalar alpha, x0 skip after attention
+  - Back-out mechanism: zero-init per-layer scalar, residual from pre-layer state
+  - HP tuning: matrix_lr 0.04→0.08, tied_embed_lr 0.05→0.02, warmdown_iters 1200→200
+- **Params**: 16,548,882 (+30 scalars for value_resid + backout)
+- **Artifact**: 14,277,707 bytes (14.3 MB, 1.7 MB headroom)
+- **Post-quant BPB**: 1.3954 (pre-quant: 1.3946, quant gap: 0.0008)
+- **Baseline comparison**: 1.4223 → 1.3954 = **0.027 BPB improvement**
+- **HP Sweep Results** (2-min runs, 127 steps):
+  - matrix_lr: 0.08 best (0.04=1.68, 0.06=1.65, 0.08=1.64, 0.10=1.64)
+  - warmdown_iters: 200 best (100=1.71, 200=1.69, 300=1.71, 400=1.74)
+  - tied_embed_lr: 0.02 best (0.01=1.66, 0.02=1.65, 0.04=1.68, 0.06=1.71)
+  - Critical fix: warmdown_iters=1200 was catastrophic with wallclock scheduling (LR ≈0.53 from step 1)
+- **Lessons**:
+  - Higher matrix_lr works well with Muon (Newton-Schulz normalizes gradients)
+  - SwiGLU 2/3-width trick maintains exact param count
+  - Quant gap near-zero (0.0008) — QAT is highly effective
+  - 1×H100 gets ~635 steps in 600s at 945ms/step
+
 ---
 
 ## Session Summary (2026-03-20)
