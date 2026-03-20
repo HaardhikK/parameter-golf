@@ -8,4 +8,8 @@ data/manifest.json
 data/docs_selected.jsonl
 .mypy_cache/
 .venv
-logs/
+.claude/
+initial_info/
+master_plan.md
+update.md
+final_model.pt

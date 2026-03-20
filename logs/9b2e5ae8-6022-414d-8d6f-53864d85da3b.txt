@@ -30,10 +30,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Weight-shared depth-recurrent architecture (Config B):
-# - 5 physical blocks x 3 = 15 virtual layers at width 672
-# - 12 attention heads with 6 KV heads (GQA), 2x MLP, partial RoPE (50%)
-# - STE QAT on all weight matrices, smear module, grad clipping
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
+# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
@@ -903,13 +902,7 @@ def main() -> None:
             dist.destroy_process_group()
         return
 
-    compile_mode = os.environ.get("COMPILE_MODE", "fullgraph")  # fullgraph, default, off
-    if compile_mode == "off":
-        compiled_model = base_model
-    elif compile_mode == "fullgraph":
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1078,13 +1071,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # Heterogeneous updates: tok accumulates gradient across embed_update_every steps.
-        # Non-tok optimizers: always zero before forward.
-        # Tok optimizer: only zero AFTER stepping (not before), so gradient accumulates.
-        update_tok = args.embed_update_every <= 1 or (step + 1) % args.embed_update_every == 0
+        # Heterogeneous updates: selectively zero grad (skip tok if accumulating)
+        update_tok = args.embed_update_every <= 1 or step % args.embed_update_every == 0
         for opt in optimizers:
-            if opt is optimizer_tok:
-                continue  # tok grad managed separately: accumulates across steps
+            if opt is optimizer_tok and not update_tok:
+                continue
             opt.zero_grad(set_to_none=True)
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1113,7 +1104,6 @@ def main() -> None:
             if opt is optimizer_tok and not update_tok:
                 continue
             opt.step()
-        # Zero grad: non-tok always, tok only after stepping
         for opt in optimizers:
             if opt is optimizer_tok and not update_tok:
                 continue
@@ -1210,3 +1200,57 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.13.12 | packaged by Anaconda, Inc. | (main, Feb 24 2026, 16:13:31) [GCC 14.3.0]
+Running PyTorch 2.10.0+cu128
+Thu Mar 19 19:32:00 2026       
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 545.31                 Driver Version: 546.18       CUDA Version: 12.3     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA GeForce RTX 4050 ...    On  | 00000000:01:00.0 Off |                  N/A |
+| N/A   48C    P3              11W /  65W |     78MiB /  6141MiB |      1%      Default |
+|                                         |                      |                  N/A |
++-----------------------------------------+----------------------+----------------------+
+                                                                                         
++---------------------------------------------------------------------------------------+
+| Processes:                                                                            |
+|  GPU   GI   CI        PID   Type   Process name                            GPU Memory |
+|        ID   ID                                                             Usage      |
+|=======================================================================================|
+|    0   N/A  N/A     66336      C   /python3.13                               N/A      |
++---------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:1
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:16548852 physical_blocks:5 virtual_layers:15
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:12 num_kv_heads:6
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04
+train_batch_tokens:16384 train_seq_len:256 iterations:10 warmup_steps:0 max_wallclock_seconds:600.000
+seed:1337
+step:0/10 val_loss:6.9498 val_bpb:4.1160 train_time:0ms step_avg:0.02ms
+step:1/10 train_loss:6.9535 train_time:113176ms step_avg:113175.90ms
+step:2/10 train_loss:19.2682 train_time:115646ms step_avg:57822.94ms
+step:3/10 train_loss:19.3107 train_time:117304ms step_avg:39101.45ms
+step:4/10 train_loss:19.1388 train_time:118517ms step_avg:29629.34ms
+step:5/10 train_loss:19.2292 train_time:119442ms step_avg:23888.32ms
+step:6/10 train_loss:18.9088 train_time:120240ms step_avg:20039.96ms
+step:7/10 train_loss:18.9266 train_time:121032ms step_avg:17290.32ms
+step:8/10 train_loss:18.8122 train_time:121645ms step_avg:15205.66ms
+step:9/10 train_loss:18.2316 train_time:122435ms step_avg:13603.86ms
+step:10/10 train_loss:18.0290 train_time:122997ms step_avg:12299.69ms
+step:10/10 val_loss:17.9422 val_bpb:10.6264 train_time:123009ms step_avg:12300.88ms
+peak memory allocated: 1075 MiB reserved: 1484 MiB
+Serialized model: 64855661 bytes
+Code size: 52348 bytes
+Total submission size: 64908009 bytes
+Serialized model int8+zlib: 4828494 bytes (payload:16757072 raw_torch:16797675 payload_ratio:3.87x)
+Total submission size int8+zlib: 4880842 bytes
