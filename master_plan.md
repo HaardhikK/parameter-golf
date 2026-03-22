@@ -6,442 +6,108 @@
 **Timeline**: March 18 – April 30, 2026. Compute credits: $1M via RunPod.
 **Submission**: GitHub PR to `records/track_10min_16mb/` with `train_gpt.py`, `train.log`, `submission.json`. Must beat SOTA by **≥0.005 nats, p<0.01**.
 
-**Current Baseline** (10-min run on 8×H100):
-- Architecture: 9 blocks, dim=512, 8 heads, 4 KV heads, 2× MLP, vocab 1024, tied embeddings
-- ~17M params, post-quant BPB: **1.2244**
-- Artifact: 15,863,489 bytes (**only 136 KB headroom!**)
-- Int8 payload: 17,178,912 bytes, zlib compresses ~8.2% (random-looking int8 data)
-- zlib compression gives ~0.918 ratio on trained int8 weights
+**Old Baseline** (weight-shared arch): BPB = 1.2244, ~17M params, int8+zlib
+**Winner Reference**: BPB = 1.1243, ~27M params, int6+zstd
 
-**Reference** (4-hour unlimited run, same arch):
-- Pre-quant BPB: 1.1749, Post-quant BPB: 1.2074
-- **Quantization gap: 0.0325 BPB** — huge degradation target
-
-**Sizing formula** (empirically verified):
-`artifact_bytes ≈ (param_count + 225K) × 0.918 + 48K`
-Max params fitting in 16 MB: ~17.15M. We are already at the ceiling.
-
-**Cloud setup**: RunPod 1×H100 80GB, 80 training shards, ~635 steps in 10 min at 945ms/step.
+**Key Insight**: The winner uses **int6 + zstd quantization** (~0.59 bytes/param) to fit ~27M params in 16MB vs our old ~17M params with int8+zlib (~0.92 bytes/param). More params > clever weight sharing at this scale.
 
 ---
 
-## Key Strategic Insight
+## Current Architecture (Winner-Based)
 
-We cannot add more parameters — the budget is fully used. The strategy is:
-1. **Depth recurrence**: Use fewer unique blocks repeated multiple times → same param count but more virtual depth AND wider per-block → fundamentally more capable model
-2. **Reduce quantization gap**: QAT to bridge the 0.03 BPB degradation
-3. **Zero-cost architecture tweaks**: Value residuals, smear module — add expressiveness without adding params
-4. **Training optimization**: Better optimizer, schedule, data diversity
+Implemented in `train_gpt.py`:
 
----
+- **11 independent blocks** (no weight sharing), dim=512, 8 heads, 4 KV heads
+- **3× MLP** with ReLU² activation
+- **Partial RoPE**: 16/64 dims + NTK scaling for long context
+- **int6 quantization** (mlp/attn) + int8 (embeddings) + zstd-22 compression
+- **Late QAT**: STE fake-quantization enabled when lr_scale < 0.18
+- **SmearGate**: Sigmoid-gated, single shared across all layers
+- **BigramHash**: 2048 buckets, dim=128 → cheap bigram features
+- **Value Embeddings**: Shared table, layers 8,9,10 (one extra vs winner)
+- **XSA**: Last 4 layers — removes self-attention bias
+- **LN Scale**: 1/sqrt(layer_idx+1) for deep layer stability
+- **EMA**: decay=0.997, fp32 accumulation
+- **SWA**: From EMA, every 40 steps (tighter than winner's 50)
+- **U-Net skip connections**: Encoder-decoder style with learned skip weights
+- **FA3/SDPA auto-detection**: FA3 on Hopper, SDPA fallback on Ada/Ampere
+- **Orthogonal init**: With proj scaling 1/sqrt(2*num_layers)
+- **AdamW weight decay**: 0.04 for both Adam and Muon params
+- **Grad clip**: 0.3
 
-## Implementation Status
+### Our Improvements Over Winner
 
-### Phase 0: Infrastructure ✅ DONE
-- `update.md` experiment ledger created
-- `SIZE_ONLY=1` mode: instantiates model, quantizes, compresses, prints artifact size
-- `COMPILE_MODE` env var (fullgraph/default/off) for local testing
-- 10 training shards downloaded
-
-### Phase 1: Depth Recurrence
-
-#### Step 1.1: Implement Weight-Shared Blocks ✅ DONE
-Physical blocks contain: `CausalSelfAttention`, `MLP` — the large matrices.
-Virtual layer params stored in `nn.ParameterList`: `attn_scales`, `mlp_scales`, `resid_mixes`, `q_gains`.
-`GPT.forward` loops over virtual layers, using `physical_blocks[i % num_physical]` for compute.
-
-#### Step 1.2: Config B ✅ DONE
-- 5 physical blocks × 3 = 15 virtual layers, dim=672, 12 heads, 6 KV heads (head_dim=56)
-- **16,548,852 params**, estimated trained artifact ~14.7 MB (~1.3 MB headroom)
-- Verified: untrained artifact = 4.87 MB, loss decreases 6.95→6.54 in 4 steps, memory 1037 MiB
-
-#### Step 1.3: Hyperparameter Tuning ✅ DONE
-Tuned on 1×H100 via 2-min sweeps validated with full 10-min run.
-- **matrix_lr**: 0.04→0.08 (higher works due to Muon gradient normalization)
-- **tied_embed_lr**: 0.05→0.02 (lower is better for tied embeddings)
-- **warmdown_iters**: 1200→200 (1200 was catastrophic — LR never reached full value)
-- **scalar_lr**: 0.04 (kept default, not yet swept)
-
-### Phase 2: Quantization-Aware Training
-
-#### Step 2.1: STE QAT ✅ DONE
-Always-on in `CastedLinear.forward` — STE pattern `w + (w_q - w).detach()`.
-`torch.compile` compatible (standard ops only).
-
-#### Step 2.2: Entropy Regularization 🟡 DEFERRED
-Add small penalty encouraging weight clustering (→ better zlib compression).
-Only if headroom becomes tight.
-
-### Phase 3: Zero-Cost Architecture Improvements
-
-#### Step 3.1: Value Residuals ✅ DONE (Option B)
-x0 skip after attention with zero-init per-layer scalar alpha. No matrix needed.
-Combined with back-out mechanism (Step Exp D).
-
-#### Step 3.2: Smear Module ✅ DONE
-Per-virtual-layer causal 1-token lookback: `F.pad(x[:,:-1,:], (0,0,1,0))`.
-Avoids data leakage (causal, not `torch.roll`).
-
-#### Step 3.3: Partial RoPE ✅ DONE
-50% of head dims (28 of 56) get RoPE; rest are position-invariant.
-
-### Phase 4: Training Optimization
-
-#### Step 4.1: NorMuon Optimizer 🔴 TODO
-After Newton-Schulz step, normalize each output neuron's update magnitude proportionally to that neuron's current weight norm → maintains uniform neuron conditioning.
-Add as optional path in Muon.step, controlled by env var.
-Expected: 0.005–0.01 BPB
-
-#### Step 4.2: Heterogeneous Embedding Updates ✅ DONE
-Accumulate grad for 2 steps, only step/zero-grad tok_embed every 2nd step.
-**Bug fix**: must NOT zero tok grad before forward — only zero after stepping.
-
-#### Step 4.3: Gradient Clipping ✅ DONE
-Default now 1.0 (was 0.0 / disabled).
-
-### Phase 5: Advanced Techniques
-
-#### Step 5.1: Long-Short Attention Windows 🔴 TODO
-2–3 global heads + remaining local (128-token window) using FlexAttention.
-Saves attention FLOPs → more steps in 10 minutes.
-Risk: torch.compile + FlexAttention compatibility needs testing.
-Expected: 0.005–0.015 BPB (speed gain)
-
-#### Step 5.2: Test-Time Longer Context 🔴 TODO
-At eval time use 2048-token sequences with RoPE NTK scaling.
-Expected: 0.005–0.02 BPB (uncertain)
-
-#### Step 5.3: Better Compression (zstd) 🟡 DEFERRED
-Replace zlib with zstandard. Marginal on random int8 data.
-Risk: must verify zstd availability on RunPod evaluation environment.
+| Change | Winner | Ours | Rationale |
+|--------|--------|------|-----------|
+| VE layers | 9,10 | 8,9,10 | More layers benefit from token identity |
+| Late QAT threshold | 0.15 | 0.18 | ~20% more QAT training steps |
+| SWA frequency | every 50 | every 40 | ~25% more averaging checkpoints |
+| Warmdown | 3500 iters | 3750 iters | More convergence tail |
+| Muon momentum warmup | 1500 steps | 1750 steps | Smoother transition |
 
 ---
 
-## New Experimental Ideas
+## Quick Reference Commands
 
-### Exp A: SwiGLU MLP ✅ DONE
-Replaced ReLU² with SwiGLU: gate(672→896) + fc(672→896) + proj(896→672) = same 1,806,336 params.
-Part of EXP-002 combined result: 0.027 BPB improvement.
-
-### Exp B: RMSNorm With Learned Scale 🔴 TODO
-Current `RMSNorm` has no learned parameters. Adding per-dim scale adds expressiveness.
-Cost: dim params per norm call (negligible).
-With weight sharing, norms inside PhysicalBlock are shared — per-virtual-layer norms would go in virtual param lists.
-
-### Exp C: ILP Architecture Search 🔴 TODO
-Use `scipy.optimize.milp` or `PuLP` to solve:
-"Find (P, V, D, H, K) that maximizes proxy quality score SUBJECT TO artifact_size(P,V,D,H,K) ≤ 16MB."
-Proxy quality: `C × (total_flops_per_step) × (steps_in_10_min)` — calibrate from cloud runs.
-Pure Python script, no changes to train_gpt.py.
-
-### Exp D: Back-Out Mechanism ✅ DONE
-At end of each virtual layer: `x = x + backout_weight * x_pre`
-Zero-init scalar per layer. Part of EXP-002 combined result.
-
-### Exp E: EoS-Aligned Batching 🔴 TODO
-Align training sequence boundaries with End-of-Sequence tokens to avoid cross-document attention bleeding.
-Small but free quality improvement. Needs changes to `DistributedTokenLoader`.
-
----
-
-## README / Rules Points Not To Miss
-
-1. **Statistical significance**: Must beat SOTA by ≥0.005 nats with p<0.01 — run multiple seeds if needed
-2. **submission.json** required — contains run_id, BPB, git hash, timestamp
-3. **No external network calls during evaluation** — submission must be fully self-contained
-4. **PR format**: Goes to `records/track_10min_16mb/YYYY-MM-DD_Description/` with train.log, train_gpt.py, submission.json
-5. **Artifact = code + compressed weights**: `code_bytes` = UTF-8 encoded train_gpt.py size — keep code lean (limit ~1500 lines)
-6. **Evaluation runs 10+10 minutes**: 10-min train + 10-min eval. Eval must complete within its window
-7. **Back-out mechanism** and **EoS-aligned batching**: documented speedrun wins not yet implemented
-8. **Attention sinks/gating**: may help with recurrent arch stability
-
----
-
-## Local Smoke Test Protocol
-
-For every change:
+### 4090 Local Quick Sanity (~5 min)
 ```bash
-# Quick correctness check (no compile, tiny model):
-ITERATIONS=4 VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=65536 WARMUP_STEPS=0 \
-TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=off \
-NUM_LAYERS=3 NUM_PHYSICAL_BLOCKS=1 MODEL_DIM=128 NUM_HEADS=4 NUM_KV_HEADS=2 \
-.venv/bin/python train_gpt.py
-
-# Artifact size check (full model, no training):
-SIZE_ONLY=1 .venv/bin/python train_gpt.py
-
-# Full model correctness (with compile):
-ITERATIONS=2 VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=65536 WARMUP_STEPS=0 \
-TRAIN_BATCH_TOKENS=16384 TRAIN_SEQ_LEN=256 COMPILE_MODE=fullgraph \
-.venv/bin/python train_gpt.py
+COMPILE_MODE=off \
+ITERATIONS=500 \
+VAL_LOSS_EVERY=100 \
+VAL_BATCH_SIZE=65536 \
+TRAIN_BATCH_TOKENS=65536 \
+TRAIN_SEQ_LEN=1024 \
+WARMDOWN_ITERS=200 \
+WARMUP_STEPS=5 \
+MAX_WALLCLOCK_SECONDS=300 \
+SWA_ENABLED=0 \
+EMA_ENABLED=0 \
+LATE_QAT_THRESHOLD=0 \
+QAT_ENABLED=0 \
+python train_gpt.py
 ```
 
-**Check**: (1) loss decreases, (2) artifact size < 16 MB, (3) compile succeeds, (4) roundtrip quant works
-
----
-
-## Implementation Progress Tracker
-
-| Phase | Step | Status | BPB Impact | Notes |
-|---|---|---|---|---|
-| 0 | Infrastructure | ✅ Done | — | SIZE_ONLY, 10 shards, update.md |
-| 1.1 | Weight sharing | ✅ Done | Enabler | PhysicalBlock + ParameterList |
-| 1.2 | Config B | ✅ Done | 0.02–0.04? | dim=672, 15 virtual, ~14.7 MB est. |
-| 1.3 | HP tuning | ✅ Done | 0.027 combined | matrix_lr=0.08, embed_lr=0.02, warmdown=200 |
-| 2.1 | STE QAT | ✅ Done | 0.01–0.03? | Always-on, STE pattern |
-| 2.2 | Entropy reg | 🟡 Deferred | small | Only if tight on space |
-| 3.1 | Value residuals | ✅ Done | part of 0.027 | Option B: x0 skip, zero-init alpha |
-| 3.2 | Smear module | ✅ Done | 0.003–0.008? | Per-virtual-layer, causal |
-| 3.3 | Partial RoPE | ✅ Done | 0.002–0.005? | 50% dims, no params |
-| 4.1 | NorMuon | 🔴 TODO | 0.005–0.01 | Research impl first |
-| 4.2 | Hetero updates | ✅ Done | 0.002–0.005? | Fixed zero-grad bug |
-| 4.3 | Grad clipping | ✅ Done | stability | Default 1.0 |
-| 5.1 | Long-short attn | 🔴 TODO | 0.005–0.015 | FlexAttention risk |
-| 5.2 | Test-time ctx | 🔴 TODO | 0.005–0.02 | RoPE NTK scaling |
-| 5.3 | zstd | 🟡 Deferred | small | Check RunPod availability |
-| Exp A | SwiGLU MLP | ✅ Done | part of 0.027 | Same param count, 2/3 hidden |
-| Exp B | RMSNorm+scale | 🔴 TODO | small | Per-virtual-layer norms |
-| Exp C | ILP arch search | 🔴 TODO | enabler | Pure Python, scipy.optimize |
-| Exp D | Back-out | ✅ Done | part of 0.027 | 1 scalar per virtual layer |
-| Exp E | EoS batching | 🔴 TODO | small | Data pipeline change |
-| — | submission.json | 🔴 TODO | required | Needed for final PR |
-
-**Realistic combined target**: 0.04–0.08 BPB improvement → final BPB of **1.14–1.18** (vs baseline 1.2244)
-
----
-
-## Phase 7: Leaderboard #1 Techniques Integration
-
-**Context**: The current #1 entry on the leaderboard achieves **1.1748 BPB** (3 seeds, p<0.001) vs our best 1.3954 BPB on 1×H100. Their techniques are well-documented and can be layered on top of our existing advantages (SwiGLU, value residuals, back-out, weight sharing, QAT). Key rules discovery: evaluation has a **separate 10-min budget** from training, and the FAQ explicitly says "we encourage competitors to push the bounds of evaluation methods as aggressively as with training methods" — making sliding window eval fully legitimate.
-
-### Step 7.1: Muon Weight Decay 🔴 TODO
-**Expected: 0.005–0.015 BPB | Risk: Very low | ~6 lines**
-
-The #1 entry uses `weight_decay=0.02` for Muon. Currently our Muon has **no weight decay at all** — it's pure momentum + Newton-Schulz zero-power approximation. Adding decoupled weight decay improves generalization and quantization robustness (smaller weight magnitudes → less quant error).
-
-- **How decoupled weight decay works**: Applied directly to the parameter AFTER the gradient step, not added to the gradient. Critical: Muon normalizes gradients via Newton-Schulz, so adding WD to the gradient would be meaningless. Must be: `p.mul_(1 - lr * weight_decay)` after `p.add_(g, alpha=-lr)`.
-- **Files**: `train_gpt.py` — Hyperparameters (~line 92), Muon `__init__` + `step()` (~lines 117-173), optimizer construction (~line 965)
-- **Changes**:
-  1. Add `muon_wd = float(os.environ.get("MUON_WD", 0.0))` to Hyperparameters
-  2. Add `weight_decay` to Muon `__init__` defaults dict
-  3. After `p.add_(g, alpha=-lr)` in `Muon.step()`: `if weight_decay > 0: p.mul_(1 - lr * weight_decay)`
-  4. Pass `weight_decay=args.muon_wd` at optimizer construction
-- **Sweep**: MUON_WD in {0.0, 0.01, 0.02, 0.05} via 2-min runs; validate best with full 10-min run
-
-### Step 7.2: FP16 Tied Embedding Export 🔴 TODO
-**Expected: 0.01–0.03 BPB | Risk: Low | ~6 lines**
-
-Currently `tok_emb.weight` (1024×672 = 688,128 elements) exceeds `INT8_KEEP_FLOAT_MAX_NUMEL` (65,536) so it gets quantized to int8 with per-row scales. The problem: with **tied embeddings**, this same weight is used for BOTH the input lookup AND the output logit projection (`F.linear(x, self.tok_emb.weight)`). Int8 quantization errors compound through both paths, degrading BPB at eval time more than other tensors.
-
-- **Size impact**: fp16 = 1.38 MB vs int8 ≈ 0.69 MB = +690 KB. Current headroom 1.7 MB → ~1.0 MB remaining after this change. Fits within 16 MB limit.
-- **Files**: `train_gpt.py` — quantization constants (~line 310) + `quantize_state_dict_int8()` (~lines 347-404)
-- **Changes**:
-  1. Add `INT8_FORCE_FP16_PATTERNS` tuple after `CONTROL_TENSOR_NAME_PATTERNS` (default: `"tok_emb"`, env-var overrideable)
-  2. Inside `quantize_state_dict_int8()`, before the `t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL` check, add:
-     ```python
-     if any(pat in name for pat in INT8_FORCE_FP16_PATTERNS):
-         kept = t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()  # fp16
-         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
-         passthrough[name] = kept
-         stats["int8_payload_bytes"] += tensor_nbytes(kept)
-         continue
-     ```
-- **Verify**: `SIZE_ONLY=1` must show artifact < 16 MB. A/B test should show reduced quant gap.
-
-### Step 7.3: Sliding Window Evaluation 🔴 TODO
-**Expected: 0.02–0.06 BPB | Risk: Medium | ~50 lines | THE BIG WIN**
-
-The #1's key insight. Standard eval scores each token with average ~512 context (positions 0-1023 averaged). Sliding window with stride=64 gives every token **960+ context tokens**. This is a pure eval-time improvement — no training changes needed.
-
-**Rules**: FAQ confirms separate 10-min eval budget and explicitly encourages this: *"we encourage competitors to push the bounds of evaluation methods as aggressively as with training methods."*
-
-- **Files**: `train_gpt.py` — `GPT.forward()` (~line 743), add new `eval_val_sliding_window()` function, final eval dispatch (~line 1208)
-- **Design**:
-  1. Modify `GPT.forward()` signature: `target_ids: Tensor | None = None`. When `None`, return logits `(B, T, V)` instead of scalar loss. Costs ~4 lines (branch at end of forward). torch.compile handles this via separate traces.
-  2. Gate with `EVAL_SLIDING_WINDOW=0` env var (default off). Training-time periodic eval stays fast. Only the final post-quant roundtrip uses sliding window.
-  3. New `eval_val_sliding_window(stride=64, eval_seq_len=1024)` function:
-     - Slide windows across val tokens at stride intervals
-     - Call `model(x, target_ids=None)` → logits, then `F.cross_entropy(logits, y, reduction='none')`
-     - Only accumulate loss/bytes for the **last `stride` positions** of each window (those with full context)
-     - Exception: first window scores all positions
-     - Batch 32-64 windows per forward for GPU efficiency
-     - Distribute windows across ranks, all-reduce final sums
-  4. Dispatch at final eval: `if args.eval_sliding_window: eval_val_sliding_window(...) else: eval_val(...)`
-- **Timing**: ~16× more compute. On 8×H100: ~60-90s. On 1×H100: ~8-9 min (tight but feasible; increase stride to 128 if needed).
-- **Regression test**: `EVAL_SLIDING_WINDOW=1 EVAL_SW_STRIDE=1024` (no overlap) must produce identical results to standard `eval_val()`.
-- **Compile note**: Use `base_model` for the sliding window eval forward to avoid interaction with the DDP/compiled training model.
-
-### Step 7.4: Overtone Spectral Embedding Init 🔴 TODO
-**Expected: 0.005–0.015 BPB | Risk: Low-medium | ~15 lines**
-
-Currently embeddings are initialized `N(0, 0.005)` — a narrow isotropic Gaussian. The #1 uses SVD power-law spectrum shaping (`S_k ~ k^{-0.5}`), matching the natural spectral structure of language embeddings. Better initialization → faster and better convergence.
-
-- **Files**: `train_gpt.py` — add `overtone_init()` helper + modify `GPT._init_weights()` (~line 736)
-- **Changes**:
-  1. Add `EMBED_INIT_MODE` HP (default "gaussian", alt "overtone") and `EMBED_INIT_ALPHA` (default 0.5)
-  2. Add `overtone_init(weight, std, alpha=0.5)`:
-     - Generate random orthogonal U via `torch.linalg.qr(randn(vocab, min(vocab,dim)))`
-     - Generate random orthogonal V via `torch.linalg.qr(randn(dim, min(vocab,dim)))`
-     - Singular values: `S_k = k^{-alpha}` (power law decay)
-     - Construct: `W = U @ diag(S) @ V.T`, then scale to desired std
-     - All at init time (before compile), no impact on compiled graphs
-  3. In `_init_weights()`: branch on `embed_init_mode`
-- **Sweep**: A/B test "gaussian" vs "overtone" over 2-min runs
-
-### Step 7.5: Phase-Transition Residual Mixing Init 🔴 TODO
-**Expected: 0.003–0.010 BPB | Risk: Low | ~8 lines**
-
-Currently `resid_mixes` is initialized to `[[1,0,...],[0,0,...]]` for every layer — meaning 100% current state, 0% initial embedding (x0). The #1 uses sigmoid-scheduled initialization so early layers preserve more of the initial embedding and later layers rely more on the processed representation. This better matches intuition: early layers should maintain more input signal, later layers should abstract more.
-
-- **Files**: `train_gpt.py` — `GPT.__init__()` resid_mixes initialization (~lines 709-712)
-- **Changes**:
-  1. Add `RESID_MIX_INIT` HP (default "flat", alt "sigmoid"), `RESID_MIX_ALPHA` (steepness, default 4.0), `RESID_MIX_CENTER` (center fraction, default 0.5)
-  2. When `resid_mix_init == "sigmoid"`:
-     ```python
-     frac = i / max(num_layers - 1, 1)
-     current_w = torch.sigmoid(torch.tensor(alpha * (frac - center))).item()
-     mix = torch.stack((torch.full((dim,), current_w), torch.full((dim,), 1-current_w)))
-     ```
-  3. Parameters remain fully learnable — this only changes where they START
-- **Sweep**: A/B test "flat" vs "sigmoid" over 2-min runs
-
----
-
-### Phase 7 Implementation Sequence
-
-| Phase | Changes | Lines Added | When |
-|-------|---------|-------------|------|
-| A | Muon WD + FP16 embedding | ~12 | First — independent, highest value-to-risk |
-| B | Overtone init + phase-transition resid | ~23 | Second — init changes, A/B test each |
-| C | Sliding window eval | ~50 | Last — largest change, needs A+B validated first |
-
-**Final line count after all**: ~1317/1500 (183 lines headroom)
-
-### Phase 7 Verification Protocol
-
-For every technique:
-1. Smoke test: `ITERATIONS=4 COMPILE_MODE=off` — loss must decrease
-2. `SIZE_ONLY=1` — artifact must stay < 16 MB
-3. Compile: `COMPILE_MODE=fullgraph ITERATIONS=2`
-4. 2-min A/B sweep with env var toggle
-5. Full 10-min validation run if it wins the sweep
-
-Sliding window extra checks:
-- Regression: `EVAL_SW_STRIDE=1024` must match standard eval exactly
-- Timing: eval time must be < 600s on target hardware
-
-### Note on the #1's "10 Layers" Technique
-
-The #1 uses 10 **unique** layers (no weight sharing) at dim≈512. We use 15 **virtual** layers at dim=672 with weight sharing. These are different architectural tradeoffs — our approach gives us wider per-block compute and more virtual depth but at the cost of diversity between layers. This is not directly adoptable without a full architecture redesign. It should be explored via **Exp C: ILP Architecture Search** which can compare P×V configurations head-to-head.
-
----
-
-## AutoResearch Integration (Phase 6)
-
-### What AutoResearch Is
-Andrej Karpathy's [AutoResearch](https://github.com/karpathy/autoresearch) is an open-source agentic system that automates the ML research loop: reading literature, generating hypotheses, editing training code, running short experiments, analyzing metrics, and iterating — independently. It uses Claude Sonnet/Opus as reasoning agents and repeatedly modifies a NanoGPT-style trainer while running fixed-length (e.g., 5-minute) runs to search architecture and hyperparameter space.
-
-This is **conceptually aligned** with Parameter Golf: both involve short repeated training runs on a small model to optimize bits-per-byte under a resource constraint.
-
-### How to Use AutoResearch with Parameter Golf
-
-**Step 1 — Adapt the domain code**
-Point AutoResearch's editable training script at a trimmed version of `train_gpt.py` (or the full file). The key constraint: any edit it proposes must still satisfy the 16 MB artifact limit. Add a pre-run check: `SIZE_ONLY=1 python train_gpt.py` — reject edits that exceed the limit.
-
-**Step 2 — Redefine the objective in `program.md`**
-Instead of validating on Shakespeare/nanochat, define the goal as:
-> "Minimize FineWeb validation BPB. The trained model + code must compress to ≤16,000,000 bytes. Training must complete in ≤10 minutes on 8×H100."
-Include the sizing formula and the `SIZE_ONLY=1` check command so the agent can self-validate.
-
-**Step 3 — Configure short local runs for cheap iteration**
-Use reduced-data, shorter-wallclock runs that still correlate with full-run BPB:
+### Artifact Size Check
 ```bash
-ITERATIONS=500 VAL_LOSS_EVERY=100 TRAIN_SEQ_LEN=512 \
-TRAIN_BATCH_TOKENS=65536 NUM_SHARDS=2 .venv/bin/python train_gpt.py
+SIZE_ONLY=1 python train_gpt.py
 ```
-Run on RTX 4050 locally (~2–3 min) to generate signal before invoking 8×H100.
 
-**Step 4 — Candidate curation workflow**
-1. AutoResearch generates N candidate variants (arch changes, LR schedules, etc.)
-2. Filter: any that fail `SIZE_ONLY=1` are discarded immediately
-3. Run short local experiments (~2 min) to rank survivors by proxy BPB
-4. Run top 2–3 on full 8×H100 for final BPB numbers
-5. Record all results in `update.md`
-
-**Step 5 — Evaluation-time independence**
-AutoResearch uses external Claude API calls — use it ONLY during development. The official submission artifact must be fully self-contained (no network calls during eval). AutoResearch is a development tool, not part of the submission.
-
-### What to Give AutoResearch to Search
-Good search targets for AutoResearch to explore autonomously:
-- LR schedules: matrix_lr, embed_lr, warmdown shape
-- MLP variant: ReLU² vs SwiGLU vs GeGLU (same param budget)
-- Virtual depth: P=4,V=16 vs P=5,V=15 vs P=6,V=12 etc.
-- Smear module: per-dim vs scalar, 1-token vs 2-token lookback
-- RoPE fraction: 25% vs 50% vs 75% of head dims
-- QAT: always-on vs delayed to final N steps
-
-### Important: Still Do Manual Research for Specific Techniques
-For well-defined techniques (NorMuon, FlexAttention), do NOT rely on AutoResearch to figure out the implementation — research it manually first:
-- NorMuon: fetch Keller Jordan's modded-nanogpt repo for exact implementation
-- FlexAttention: check PyTorch docs and fullgraph=True compatibility
-- Read `initial_info/nanogpt_insights.md` first for any local notes on these
+### Full 8×H100 Run
+```bash
+SEED=1337 NUM_LAYERS=11 MLP_MULT=3.0 XSA_LAST_N=4 ROPE_DIMS=16 LN_SCALE=1 \
+SWA_ENABLED=1 SWA_EVERY=40 LATE_QAT_THRESHOLD=0.18 WARMDOWN_ITERS=3750 \
+VE_ENABLED=1 VE_DIM=128 VE_LAYERS=8,9,10 \
+EMA_ENABLED=1 EMA_DECAY=0.997 \
+BIGRAM_VOCAB_SIZE=2048 BIGRAM_DIM=128 ADAM_WD=0.04 MUON_WD=0.04 \
+MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+MUON_MOMENTUM_WARMUP_STEPS=1750 \
+torchrun --nproc_per_node=8 train_gpt.py
+```
 
 ---
+
+## Verification Checklist
+
+1. **Artifact size**: `SIZE_ONLY=1 python train_gpt.py` → must be < 16MB
+2. **Loss decreases**: Quick local run → loss should drop from ~7.0 to < 6.0
+3. **VRAM fits**: Single 4050/4090 with 65K batch tokens → < 24GB
+4. **Quant roundtrip**: int6+zstd → decompress → dequantize → eval works
+5. **SDPA fallback**: Works on 4050/4090 (no flash_attn_interface needed)
+6. **Sliding window eval**: Produces BPB metric correctly
+7. **EMA + SWA**: Weight averaging runs and loads correctly
+8. **Full local run**: 500 iterations on 4050/4090, loss decreasing
+
+---
+
+## Key Dependencies
+
+- `zstandard` Python package (for zstd compression)
+- `flash_attn_interface` — only on Hopper GPUs (RunPod H100), NOT needed for 4050/4090
+- `sentencepiece`, `torch`, `numpy`
 
 ## Critical Files
-- `train_gpt.py` — All model code (~1232 lines, limit 1500)
-- `update.md` — Experiment ledger
-- `records/track_10min_16mb/` — Submission folder
+- `train_gpt.py` — All model + training code
+- `winner_train_gpt.py` — Original winner code for reference
+- `master_plan.md` — This file
 - `data/cached_challenge_fineweb.py` — Download more shards
-- `initial_info/nanogpt_insights.md` — Speedrun techniques reference
 - `initial_info/evaluation.md` — Official rules
-- `records/track_10min_16mb/2026-03-17_NaiveBaseline/train.log` — Baseline convergence curve
-
----
-
-## Starting Prompt for New Session
-
-```
-About this project: I'm participating in the OpenAI Parameter Golf challenge
-(March–April 2026). Challenge details are in initial_info/challenge.md.
-The rules are in initial_info/evaluation.md. Inspiration from speedruns
-is in initial_info/nanogpt_insights.md.
-
-The goal: train the best language model fitting in 16MB artifact, trainable
-in <10 min on 8×H100s. Metric: BPB on FineWeb validation set (lower = better).
-Current SOTA (baseline): 1.2244 BPB. Need to beat by ≥0.005 nats.
-
-What's been done so far (all in train_gpt.py):
-1. Weight-shared depth recurrence: 5 physical blocks × 3 = 15 virtual layers,
-   dim=672, 12 heads, 6 KV heads, 16.55M params (~14.7 MB trained artifact)
-2. STE QAT: always-on fake quantization in CastedLinear, directly attacks the
-   0.0325 BPB quantization gap
-3. Smear module: causal 1-token lookback per virtual layer (free local context)
-4. Partial RoPE: 50% of head dims get rotary, rest position-invariant
-5. Heterogeneous embedding updates: grad accumulates 2 steps for embeddings
-6. Grad clipping enabled (1.0), 10 training shards downloaded
-7. SIZE_ONLY=1 mode for instant artifact size check
-8. COMPILE_MODE env var (fullgraph/default/off) for local testing
-
-What failed / gotchas:
-- Rotary caching caused inference-mode tensor bug (removed caching)
-- Heterogeneous updates: must NOT zero embedding grad before forward,
-  only after stepping (fixed)
-- fullgraph=True compilation takes ~3 min on RTX 4050 (fast on H100)
-
-What still needs doing (priority order):
-1. HP tuning for new arch on 8×H100 (matrix_lr, embed_lr, warmdown_iters)
-2. Value residuals (need shared W_v0 projection or simpler skip variant)
-3. NorMuon optimizer
-4. SwiGLU MLPs (same param count as ReLU², potentially better)
-5. Long-short attention windows (FlexAttention)
-6. ILP architecture search (scipy.optimize.milp to find optimal config)
-7. Back-out mechanism, EoS-aligned batching
-
-The experiment ledger is in update.md. Memory files are in
-~/.claude/projects/-home-kunder-parameter-golf/memory/
-
-Baseline run logs: records/track_10min_16mb/2026-03-17_NaiveBaseline/
-Local setup: RTX 4050 5GB VRAM, WSL2 Ubuntu 24.04, Python 3.13, PyTorch 2.10
-Cloud: RunPod 8×H100, use torchrun for distributed training
-```

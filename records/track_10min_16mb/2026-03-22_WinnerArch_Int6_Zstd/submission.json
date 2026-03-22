@@ -1,0 +1,13 @@
+{
+  "author": "HaardhikK",
+  "github_id": "HaardhikK",
+  "name": "WinnerArch Int6+Zstd — 11L 512dim GQA, EMA+SWA, Late QAT",
+  "blurb": "11 independent transformer layers, dim=512, 8 heads, 4 KV heads (GQA), 3x MLP ReLU^2, int6+zstd compression (~27M params in <16MB). EMA(0.997)+SWA(every 40) stacking, late QAT at scale<0.18, BigramHash, Value Embeddings(layers 8,9,10), XSA last 4 layers, partial RoPE 16/64 dims, Muon optimizer.",
+  "date": "FILL_IN_AFTER_RUN",
+  "val_loss": 0.0,
+  "val_bpb": 0.0,
+  "bytes_total": 0,
+  "bytes_code": 0,
+  "seeds_run": [1337, 42, 7],
+  "seed_bpbs": [0.0, 0.0, 0.0]
+}
