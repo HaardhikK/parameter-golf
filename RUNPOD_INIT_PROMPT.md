@@ -20,8 +20,11 @@ cd /workspace
 git clone -b runpod --single-branch https://github.com/HaardhikK/parameter-golf.git
 cd parameter-golf
 bash setup.sh
+above part done
+continue from here :
 source .venv/bin/activate
 python3 data/cached_challenge_fineweb.py --variant sp1024
+NOTE: FA3 MUST BE INSTALLED IF NOT, ITS VERY IMPORTANT 
 ```
 
 The data download gets the full validation split + 80 training shards (~8B tokens).
